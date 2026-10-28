@@ -269,6 +269,12 @@ class MistralModel(Model):
 
                 if "text" in content or "image" in content:
                     message_contents.append(self._format_request_message_content(content))
+                elif "reasoningContent" in content:
+                    reasoning_text = content["reasoningContent"].get("reasoningText", {}).get("text")
+                    if reasoning_text:
+                        message_contents.append(
+                            {"type": "thinking", "thinking": [{"type": "text", "text": reasoning_text}]}
+                        )
                 elif "toolUse" in content:
                     tool_calls.append(self._format_request_message_tool_call(content["toolUse"]))
                 elif "toolResult" in content:
@@ -426,8 +432,7 @@ class MistralModel(Model):
             case _:
                 raise RuntimeError(f"chunk_type=<{event['chunk_type']}> | unknown type")
 
-    @staticmethod
-    def _content_parts(content: Any) -> list[tuple[str, str]]:
+    def _content_parts(self, content: Any) -> list[tuple[str, str]]:
         """Split Mistral message content into ``(data_type, text)`` parts.
 
         Content is a plain string for most models. Reasoning models (for example Mistral Large 4) return a list of
@@ -458,6 +463,26 @@ class MistralModel(Model):
                 parts.append(("text", chunk.text))
         return parts
 
+    def _content_events(self, content: Any, data_type: str | None) -> tuple[list[dict[str, Any]], str | None]:
+        """Turn Mistral message content into content events, opening a new block whenever the part type changes.
+
+        Args:
+            content: The ``content`` of a Mistral message or stream delta.
+            data_type: The type of the block that is currently open, if any.
+
+        Returns:
+            The events, and the type of the block left open. The caller closes that block.
+        """
+        events: list[dict[str, Any]] = []
+        for part_type, text in self._content_parts(content):
+            if part_type != data_type:
+                if data_type is not None:
+                    events.append({"chunk_type": "content_stop", "data_type": data_type})
+                events.append({"chunk_type": "content_start", "data_type": part_type})
+                data_type = part_type
+            events.append({"chunk_type": "content_delta", "data_type": part_type, "data": text})
+        return events, data_type
+
     def _handle_non_streaming_response(self, response: Any) -> Iterable[dict[str, Any]]:
         """Handle non-streaming response from Mistral API.
 
@@ -472,14 +497,8 @@ class MistralModel(Model):
         if response.choices and response.choices[0].message:
             message = response.choices[0].message
 
-            data_type: str | None = None
-            for part_type, text in self._content_parts(getattr(message, "content", None)):
-                if part_type != data_type:
-                    if data_type is not None:
-                        yield {"chunk_type": "content_stop"}
-                    yield {"chunk_type": "content_start", "data_type": part_type}
-                    data_type = part_type
-                yield {"chunk_type": "content_delta", "data_type": part_type, "data": text}
+            events, data_type = self._content_events(getattr(message, "content", None), None)
+            yield from events
             if data_type is not None:
                 yield {"chunk_type": "content_stop"}
 
@@ -554,7 +573,6 @@ class MistralModel(Model):
 
                 data_type: str | None = None
                 tool_calls: dict[str, list[Any]] = {}
-                accumulated_text = ""
 
                 async for chunk in stream_response:
                     if hasattr(chunk, "data") and hasattr(chunk.data, "choices") and chunk.data.choices:
@@ -563,18 +581,9 @@ class MistralModel(Model):
                         if hasattr(choice, "delta"):
                             delta = choice.delta
 
-                            for part_type, text in self._content_parts(getattr(delta, "content", None)):
-                                if part_type != data_type:
-                                    if data_type is not None:
-                                        yield self.format_chunk({"chunk_type": "content_stop", "data_type": data_type})
-                                    yield self.format_chunk({"chunk_type": "content_start", "data_type": part_type})
-                                    data_type = part_type
-
-                                yield self.format_chunk(
-                                    {"chunk_type": "content_delta", "data_type": part_type, "data": text}
-                                )
-                                if part_type == "text":
-                                    accumulated_text += text
+                            events, data_type = self._content_events(getattr(delta, "content", None), data_type)
+                            for event in events:
+                                yield self.format_chunk(event)
 
                             if hasattr(delta, "tool_calls") and delta.tool_calls:
                                 for tool_call in delta.tool_calls:

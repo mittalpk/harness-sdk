@@ -439,6 +439,48 @@ def test_format_request_with_tool_result(model, model_id):
     assert actual_request == exp_request
 
 
+def test_format_request_messages_keeps_reasoning_before_text(model):
+    messages = [
+        {"role": "user", "content": [{"text": "What time is it?"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"reasoningContent": {"reasoningText": {"text": "Check the clock."}}},
+                {"text": "It is noon."},
+            ],
+        },
+    ]
+
+    tru_messages = model._format_request_messages(messages)
+    exp_messages = [
+        {"role": "user", "content": "What time is it?"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "Check the clock."}]},
+                {"type": "text", "text": "It is noon."},
+            ],
+        },
+    ]
+
+    assert tru_messages == exp_messages
+
+
+def test_format_request_messages_keeps_reasoning_only_assistant_message(model):
+    messages = [
+        {"role": "user", "content": [{"text": "Think first."}]},
+        {"role": "assistant", "content": [{"reasoningContent": {"reasoningText": {"text": "Thinking."}}}]},
+    ]
+
+    tru_messages = model._format_request_messages(messages)
+    exp_messages = [
+        {"role": "user", "content": "Think first."},
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": [{"type": "text", "text": "Thinking."}]}]},
+    ]
+
+    assert tru_messages == exp_messages
+
+
 @pytest.mark.parametrize("text_position", [None, "before", "after"])
 def test_format_request_messages_orders_tool_results_before_injected_text(model, text_position):
     messages = [
